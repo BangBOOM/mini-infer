@@ -14,68 +14,6 @@ logging.basicConfig(
 
 logger = logging.getLogger("Qwen3")
 
-def apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> torch.Tensor:
-    cos = cos.unsqueeze(-2)
-    sin = sin.unsqueeze(-2)
-    x1, x2 = torch.chunk(x.to(torch.float32), 2, dim=-1)
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
-
-
-class RotaryEmbedding(nn.Module):
-
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: float,
-    ) -> None:
-        super().__init__()
-        self.head_size = head_size
-        assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
-
-    # @torch.compile
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_tokens = positions.size(0)
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
-        query = apply_rotary_emb(query, cos, sin).view(query_shape)
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
-        key = apply_rotary_emb(key, cos, sin).view(key_shape)
-        return query, key
-
-def get_rope(
-    head_size: int,
-    rotary_dim: int,
-    max_position: int,
-    base: float,
-    rope_scaling: dict | None = None,
-):
-    assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
-
 def add_rms_norm(x, residual, weight, eps)->tuple[torch.Tensor, torch.Tensor]:
     orig_dtype = x.dtype
     if residual is not None:
@@ -135,15 +73,6 @@ class Qwen3(nn.Module):
         self.model_norm = nn.Parameter(torch.empty(config.hidden_size))
         self.lm_head = nn.Parameter(torch.empty(config.vocab_size, config.hidden_size))
 
-        self.register_buffer("kv_cache", torch.zeros(config.num_hidden_layers, 2, config.num_key_value_heads, config.max_position_embeddings, config.head_dim))
-
-        self.rope = get_rope(
-            config.head_dim,
-            rotary_dim=config.head_dim,
-            max_position=config.max_position_embeddings,
-            base=config.rope_theta
-        )
-
 
     def load_weight(self, path):
         # currently only support single file
@@ -174,7 +103,7 @@ class Qwen3(nn.Module):
         logger.info("Model Loaded")
 
     @torch.no_grad()
-    def forward(self, input_ids:torch.Tensor, positions:torch.Tensor, is_prefill=False):
+    def forward(self, input_ids:torch.Tensor, positions:torch.Tensor, kv_cache:torch.Tensor, cos_sin_cache:torch.Tensor, is_prefill=False):
         rms_norm_eps = self.config.rms_norm_eps
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -184,6 +113,13 @@ class Qwen3(nn.Module):
         head_dim = self.config.head_dim
         num_attention_heads = self.config.num_attention_heads
         num_key_value_heads = self.config.num_key_value_heads
+
+        # Apply RoPE
+        num_tokens = positions.size(0)
+        cos_sin = cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
 
         for i in range(self.config.num_hidden_layers):
             # Input Norm
@@ -199,18 +135,33 @@ class Qwen3(nn.Module):
 
             q = rms_norm(q, self.q_norm[i].data, rms_norm_eps)
             k = rms_norm(k, self.k_norm[i].data, rms_norm_eps)
-            q, k = self.rope(positions, q, k)
+
+            # Apply RoPE to q
+            q_shape = q.shape
+            q = q.view(num_tokens, -1, head_dim)
+            x1, x2 = torch.chunk(q.to(torch.float32), 2, dim=-1)
+            y1 = x1 * cos - x2 * sin
+            y2 = x2 * cos + x1 * sin
+            q = torch.cat((y1, y2), dim=-1).to(q.dtype).view(q_shape)
+
+            # Apply RoPE to k
+            k_shape = k.shape
+            k = k.view(num_tokens, -1, head_dim)
+            x1, x2 = torch.chunk(k.to(torch.float32), 2, dim=-1)
+            y1 = x1 * cos - x2 * sin
+            y2 = x2 * cos + x1 * sin
+            k = torch.cat((y1, y2), dim=-1).to(k.dtype).view(k_shape)
 
             # batch, head_cnt, seq_len, head_dim
             q = q.permute(0, 2, 1, 3)
             k = k.permute(0, 2, 1, 3)
             v = v.permute(0, 2, 1, 3)
 
-            self.kv_cache[i][0][:, positions, :] = k
-            self.kv_cache[i][1][:, positions, :] = v
+            kv_cache[i][0][:, positions, :] = k
+            kv_cache[i][1][:, positions, :] = v
 
-            k = self.kv_cache[i][0][:, :positions[-1]+1, :]
-            v = self.kv_cache[i][1][:, :positions[-1]+1, :]
+            k = kv_cache[i][0][:, :positions[-1]+1, :]
+            v = kv_cache[i][1][:, :positions[-1]+1, :]
 
             o = F.scaled_dot_product_attention(q, k, v, is_causal=is_prefill, enable_gqa=True)
 
