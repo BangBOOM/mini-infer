@@ -34,6 +34,26 @@ def rms_norm(x, weight, eps)->torch.Tensor:
     return x
 
 
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply Rotary Position Embedding (RoPE) to input tensor.
+    
+    Args:
+        x: Input tensor of shape (num_tokens, num_heads, head_dim)
+        cos: Cosine values of shape (num_tokens, 1, head_dim//2)
+        sin: Sine values of shape (num_tokens, 1, head_dim//2)
+    
+    Returns:
+        Tensor with RoPE applied, same shape as input
+    """
+    orig_shape = x.shape
+    head_dim = x.shape[-1]
+    x = x.view(-1, orig_shape[-2], head_dim)
+    x1, x2 = torch.chunk(x.to(torch.float32), 2, dim=-1)
+    y1 = x1 * cos - x2 * sin
+    y2 = x2 * cos + x1 * sin
+    return torch.cat((y1, y2), dim=-1).to(x.dtype).view(orig_shape)
+
+
 @dataclass
 class Qwen3Config:
     head_dim: int
@@ -136,21 +156,9 @@ class Qwen3(nn.Module):
             q = rms_norm(q, self.q_norm[i].data, rms_norm_eps)
             k = rms_norm(k, self.k_norm[i].data, rms_norm_eps)
 
-            # Apply RoPE to q
-            q_shape = q.shape
-            q = q.view(num_tokens, -1, head_dim)
-            x1, x2 = torch.chunk(q.to(torch.float32), 2, dim=-1)
-            y1 = x1 * cos - x2 * sin
-            y2 = x2 * cos + x1 * sin
-            q = torch.cat((y1, y2), dim=-1).to(q.dtype).view(q_shape)
-
-            # Apply RoPE to k
-            k_shape = k.shape
-            k = k.view(num_tokens, -1, head_dim)
-            x1, x2 = torch.chunk(k.to(torch.float32), 2, dim=-1)
-            y1 = x1 * cos - x2 * sin
-            y2 = x2 * cos + x1 * sin
-            k = torch.cat((y1, y2), dim=-1).to(k.dtype).view(k_shape)
+            # Apply RoPE to q and k
+            q = apply_rope(q.view(num_tokens, -1, head_dim), cos, sin).view(batch_size, seqlen, num_attention_heads, head_dim)
+            k = apply_rope(k.view(num_tokens, -1, head_dim), cos, sin).view(batch_size, seqlen, num_key_value_heads, head_dim)
 
             # batch, head_cnt, seq_len, head_dim
             q = q.permute(0, 2, 1, 3)
