@@ -7,51 +7,14 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from tqdm import tqdm
 
+from models.utils import add_rms_norm, apply_rope, rms_norm
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
 logger = logging.getLogger("Qwen3")
-
-def add_rms_norm(x, residual, weight, eps)->tuple[torch.Tensor, torch.Tensor]:
-    orig_dtype = x.dtype
-    if residual is not None:
-        x += residual
-    residual = x
-    x = x.to(torch.float32)
-    var = x.pow(2).mean(dim=-1, keepdim=True)
-    x.mul_(torch.rsqrt(var + eps))
-    x = x.to(orig_dtype).mul_(weight)
-    return x, residual
-
-def rms_norm(x, weight, eps)->torch.Tensor:
-    orig_dtype = x.dtype
-    x = x.to(torch.float32)
-    var = x.pow(2).mean(dim=-1, keepdim=True)
-    x.mul_(torch.rsqrt(var + eps))
-    x = x.to(orig_dtype).mul_(weight)
-    return x
-
-
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply Rotary Position Embedding (RoPE) to input tensor.
-    
-    Args:
-        x: Input tensor of shape (num_tokens, num_heads, head_dim)
-        cos: Cosine values of shape (num_tokens, 1, head_dim//2)
-        sin: Sine values of shape (num_tokens, 1, head_dim//2)
-    
-    Returns:
-        Tensor with RoPE applied, same shape as input
-    """
-    orig_shape = x.shape
-    head_dim = x.shape[-1]
-    x = x.view(-1, orig_shape[-2], head_dim)
-    x1, x2 = torch.chunk(x.to(torch.float32), 2, dim=-1)
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype).view(orig_shape)
 
 
 @dataclass
