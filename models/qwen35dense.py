@@ -95,6 +95,10 @@ class FullAtention(nn.Module):
         k = k.view(batch_size, seqlen, num_key_value_heads, head_dim)
         v = v.view(batch_size, seqlen, num_key_value_heads, head_dim)
 
+        rms_norm_eps = self.config.rms_norm_eps
+        q = rms_norm(q, self.q_norm.data, rms_norm_eps)
+        k = rms_norm(k, self.k_norm.data, rms_norm_eps)
+
         # Apply RoPE to q and k
         q = apply_rope(q.view(num_tokens, -1, head_dim), cos, sin).view(batch_size, seqlen, num_attention_heads, head_dim)
         k = apply_rope(k.view(num_tokens, -1, head_dim), cos, sin).view(batch_size, seqlen, num_key_value_heads, head_dim)
@@ -373,10 +377,7 @@ class Qwen3_5(nn.Module):
 
         batch_size, seqlen, _ = hidden_states.shape
         assert batch_size == 1, "Currently only support singual request"
-        head_dim = self.config.head_dim
-
-        # Apply RoPE
-        num_tokens = positions.size(0)
+        # get cos and sin
         cos_sin = cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         cos = cos.unsqueeze(-2)
