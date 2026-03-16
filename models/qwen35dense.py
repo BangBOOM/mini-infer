@@ -1,9 +1,9 @@
 import logging
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pydantic import BaseModel
 from safetensors import safe_open
 from tqdm import tqdm
 
@@ -14,8 +14,7 @@ logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(leve
 logger = logging.getLogger("Qwen3_5")
 
 
-@dataclass
-class RopeConfig:
+class RopeConfig(BaseModel):
     mrope_interleaved: bool
     mrope_section: list[int]
     rope_type: str
@@ -23,8 +22,7 @@ class RopeConfig:
     partial_rotary_factor: float
 
 
-@dataclass
-class Qwen3_5Config:
+class Qwen3_5Config(BaseModel):
     head_dim: int
     hidden_size: int
     hidden_act: str
@@ -35,7 +33,7 @@ class Qwen3_5Config:
     num_key_value_heads: int
     attn_output_gate: bool
     vocab_size: int
-    # rope_theta: int
+
     rms_norm_eps: float
     rope_parameters: RopeConfig
 
@@ -53,21 +51,13 @@ class FullAtention(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
-        self.q_proj = nn.Parameter(
-            torch.empty(
-                config.num_attention_heads * config.head_dim * (1 + config.attn_output_gate), config.hidden_size
-            )
-        )
+        self.q_proj = nn.Parameter(torch.empty(config.num_attention_heads * config.head_dim * 2, config.hidden_size))
         self.k_proj = nn.Parameter(torch.empty(config.num_key_value_heads * config.head_dim, config.hidden_size))
         self.v_proj = nn.Parameter(torch.empty(config.num_key_value_heads * config.head_dim, config.hidden_size))
         self.o_proj = nn.Parameter(torch.empty(config.hidden_size, config.num_attention_heads * config.head_dim))
 
         self.q_norm = nn.Parameter(torch.empty(config.head_dim))
         self.k_norm = nn.Parameter(torch.empty(config.head_dim))
-
-        self.register_buffer(
-            "kv_cache", torch.zeros(2, config.num_key_value_heads, config.max_position_embeddings, config.head_dim)
-        )
 
     def load_weight(self, f):
         self.q_proj.data.copy_(f.get_tensor(f"model.language_model.layers.{self.layer_idx}.self_attn.q_proj.weight"))
@@ -78,30 +68,41 @@ class FullAtention(nn.Module):
         self.q_norm.data.copy_(f.get_tensor(f"model.language_model.layers.{self.layer_idx}.self_attn.q_norm.weight"))
         self.k_norm.data.copy_(f.get_tensor(f"model.language_model.layers.{self.layer_idx}.self_attn.k_norm.weight"))
 
-    def forward(self, hidden_states: torch.Tensor, position: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_prefill:bool):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: dict[str, torch.Tensor],
+        is_prefill: bool,
+    ):
         assert self.config.attn_output_gate, "attn_output_gate must be True for Qwen3.5 dense attention"
         num_attention_heads = self.config.num_attention_heads
         head_dim = self.config.head_dim
         num_key_value_heads = self.config.num_key_value_heads
         num_tokens = position.size(0)
         batch_size, seqlen, _ = hidden_states.shape
-        q_gate = torch.einsum('bsh,oh->bso', hidden_states, self.q_proj.data)
-        k = torch.einsum('bsh,oh->bso', hidden_states, self.k_proj.data)
-        v = torch.einsum('bsh,oh->bso', hidden_states, self.v_proj.data)
+        q_gate = torch.einsum("bsh,oh->bso", hidden_states, self.q_proj.data)
+        k = torch.einsum("bsh,oh->bso", hidden_states, self.k_proj.data)
+        v = torch.einsum("bsh,oh->bso", hidden_states, self.v_proj.data)
 
+        q_gate = q_gate.view(batch_size, seqlen, num_attention_heads, head_dim * 2)
         q, gate = torch.chunk(q_gate, 2, dim=-1)
-        gate = gate.view(batch_size, seqlen, num_attention_heads, head_dim)
-        q = q.view(batch_size, seqlen, num_attention_heads, head_dim)
         k = k.view(batch_size, seqlen, num_key_value_heads, head_dim)
         v = v.view(batch_size, seqlen, num_key_value_heads, head_dim)
 
         rms_norm_eps = self.config.rms_norm_eps
-        q = rms_norm(q, self.q_norm.data, rms_norm_eps)
-        k = rms_norm(k, self.k_norm.data, rms_norm_eps)
+        q = rms_norm(q, self.q_norm.data + 1.0, rms_norm_eps)
+        k = rms_norm(k, self.k_norm.data + 1.0, rms_norm_eps)
 
         # Apply RoPE to q and k
-        q = apply_rope(q.view(num_tokens, -1, head_dim), cos, sin).view(batch_size, seqlen, num_attention_heads, head_dim)
-        k = apply_rope(k.view(num_tokens, -1, head_dim), cos, sin).view(batch_size, seqlen, num_key_value_heads, head_dim)
+        q = apply_rope(q.view(num_tokens, -1, head_dim), cos, sin).view(
+            batch_size, seqlen, num_attention_heads, head_dim
+        )
+        k = apply_rope(k.view(num_tokens, -1, head_dim), cos, sin).view(
+            batch_size, seqlen, num_key_value_heads, head_dim
+        )
 
         # batch, head_cnt, seq_len, head_dim
         gate = gate.permute(0, 2, 1, 3)
@@ -109,19 +110,17 @@ class FullAtention(nn.Module):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        self.kv_cache[0][:, position, :] = k
-        self.kv_cache[1][:, position, :] = v
+        cache["key"][:, position, :] = k
+        cache["value"][:, position, :] = v
 
-        k = self.kv_cache[0][:, :position[-1]+1, :]
-        v = self.kv_cache[1][:, :position[-1]+1, :]
+        k = cache["key"][:, : position[-1] + 1, :]
+        v = cache["value"][:, : position[-1] + 1, :]
 
         o = F.scaled_dot_product_attention(q, k, v, is_causal=is_prefill, enable_gqa=True)
         o = o * torch.sigmoid(gate)
 
-        hidden_states = torch.einsum('bhsd,ohd->bso', o, self.o_proj.data.view(-1, num_attention_heads, head_dim))
-
+        hidden_states = torch.einsum("bhsd,ohd->bso", o, self.o_proj.data.view(-1, num_attention_heads, head_dim))
         return hidden_states
-
 
 
 class LinearAttention(nn.Module):
@@ -133,22 +132,19 @@ class LinearAttention(nn.Module):
         self.value_dim = config.linear_num_value_heads * config.linear_value_head_dim
         self.activation = config.hidden_act
         self.conv_dim = self.key_dim * 2 + self.value_dim
-        self.A_log = nn.Parameter(torch.empty(config.linear_num_value_heads, dtype=torch.float32))
+        # Initialize A_log same as reference: uniform(0, 16) then log
+        A = torch.empty(config.linear_num_value_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
         self.conv1d = nn.Parameter(torch.empty(self.conv_dim, 1, config.linear_conv_kernel_dim))
         self.dt_biase = nn.Parameter(torch.ones(config.linear_num_value_heads))
         self.in_proj_a = nn.Parameter(torch.empty(config.linear_num_value_heads, config.hidden_size))
         self.in_proj_b = nn.Parameter(torch.empty(config.linear_num_value_heads, config.hidden_size))
-        self.in_proj_qkv = nn.Parameter(torch.empty(sum([self.key_dim, self.key_dim, self.value_dim]), config.hidden_size))
+        self.in_proj_qkv = nn.Parameter(
+            torch.empty(sum([self.key_dim, self.key_dim, self.value_dim]), config.hidden_size)
+        )
         self.in_proj_z = nn.Parameter(torch.empty(self.value_dim, config.hidden_size))
         self.norm = nn.Parameter(torch.empty(config.linear_value_head_dim, dtype=torch.float32))
         self.out_proj = nn.Parameter(torch.empty(config.hidden_size, self.value_dim))
-
-        self.register_buffer(
-            "recurrent_state", torch.zeros(1, config.linear_num_value_heads, config.linear_key_head_dim, config.linear_value_head_dim)
-        )
-        self.register_buffer(
-            "conv_state", torch.zeros(1, self.conv_dim, config.linear_conv_kernel_dim)
-        )
 
     def load_weight(self, f):
         self.A_log.data.copy_(f.get_tensor(f"model.language_model.layers.{self.layer_idx}.linear_attn.A_log"))
@@ -171,41 +167,45 @@ class LinearAttention(nn.Module):
             f.get_tensor(f"model.language_model.layers.{self.layer_idx}.linear_attn.out_proj.weight")
         )
 
-    def forward(self, hidden_states: torch.Tensor, is_prefill:bool):
+    def forward(self, hidden_states: torch.Tensor, cache: dict[str, torch.Tensor], is_prefill: bool):
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == 1, "currently only support batch size == 1"
-        mixed_qkv = torch.einsum('bsh, oh->bso', hidden_states, self.in_proj_qkv.data)
+        mixed_qkv = torch.einsum("bsh, oh->bso", hidden_states, self.in_proj_qkv.data)
 
-        '''
+        """
         输入 T=5:
         原始: [x1, x2, x3, x4, x5]
         padding后: [0, 0, 0, x1, x2, x3, x4, x5]  ← 左边补3个0
                                  ↑
         conv输出长度 = 5 + 3 = 8
         [:, :, :5] 截断 → 取前5个，丢掉右边3个
-        '''
+        """
         mixed_qkv = mixed_qkv.transpose(1, 2)
         if is_prefill:
-            self.conv_state = F.pad(mixed_qkv, (self.config.linear_conv_kernel_dim - mixed_qkv.shape[-1], 0))
+            cache["conv_state"].copy_(F.pad(mixed_qkv, (self.config.linear_conv_kernel_dim - mixed_qkv.shape[-1], 0)))
             mixed_qkv = F.silu(
                 F.conv1d(
                     input=mixed_qkv,
-                    weight=self.conv1d.data, bias=None, stride=1,
-                    padding=self.config.linear_conv_kernel_dim-1,
-                    groups=self.conv_dim
+                    weight=self.conv1d.data,
+                    bias=None,
+                    stride=1,
+                    padding=self.config.linear_conv_kernel_dim - 1,
+                    groups=self.conv_dim,
                 )[:, :, :seq_len]
-            )   # need to save the recent
+            )  # need to save the recent
         else:
-            conv_state = self.conv_state
+            conv_state = cache["conv_state"]
             state_len = conv_state.shape[-1]
             hidden_states_new = torch.cat([conv_state, mixed_qkv], dim=-1)
-            self.conv_state.copy_(hidden_states_new[:, :, -state_len:])
+            cache["conv_state"].copy_(hidden_states_new[:, :, -state_len:])
             mixed_qkv = F.silu(
                 F.conv1d(
                     input=hidden_states_new,
-                    weight=self.conv1d.data, bias=None, stride=1,
+                    weight=self.conv1d.data,
+                    bias=None,
+                    stride=1,
                     padding=0,
-                    groups=self.conv_dim
+                    groups=self.conv_dim,
                 )[:, :, -seq_len:]
             )
         mixed_qkv = mixed_qkv.transpose(1, 2)
@@ -214,12 +214,13 @@ class LinearAttention(nn.Module):
         key = key.reshape(batch_size, seq_len, -1, self.config.linear_key_head_dim)
         value = value.reshape(batch_size, seq_len, -1, self.config.linear_value_head_dim)
 
-        a = torch.einsum('bsh, oh->bso', hidden_states, self.in_proj_a.data)
-        b = torch.einsum('bsh, oh->bso', hidden_states, self.in_proj_b.data)
-        g = -self.A_log.data.exp() * F.softplus(a.float() + self.dt_biase.data)
+        a = torch.einsum("bsh, oh->bso", hidden_states, self.in_proj_a.data)
+        b = torch.einsum("bsh, oh->bso", hidden_states, self.in_proj_b.data)
+        # Use float32 for A_log and computation (same as reference)
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_biase.float())
         beta = b.sigmoid()
 
-        z = torch.einsum('bsh, oh->bso', hidden_states, self.in_proj_z.data)
+        z = torch.einsum("bsh, oh->bso", hidden_states, self.in_proj_z.data)
         z = z.reshape(batch_size, seq_len, -1, self.config.linear_value_head_dim)
 
         # ratio = self.config.linear_num_value_heads // self.config.linear_num_key_heads
@@ -243,10 +244,11 @@ class LinearAttention(nn.Module):
         query = query * scale
 
         core_attn_out = torch.zeros_like(value)
-        if is_prefill:
-            self.recurrent_state.zero_()
 
-        last_recurrent_state = self.recurrent_state
+        if is_prefill:
+            cache["recurrent_state"].zero_()
+
+        last_recurrent_state = cache["recurrent_state"]
         for i in range(seq_len):
             q_t = query[:, :, i]
             k_t = key[:, :, i]
@@ -260,7 +262,7 @@ class LinearAttention(nn.Module):
             last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
 
-        self.recurrent_state.copy_(last_recurrent_state)
+        cache["recurrent_state"].copy_(last_recurrent_state)
         core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(torch.bfloat16)
 
         core_attn_out = core_attn_out.reshape(-1, self.config.linear_value_head_dim)
@@ -274,7 +276,7 @@ class LinearAttention(nn.Module):
         core_attn_out = core_attn_out.to(torch.bfloat16)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        hidden_states = torch.einsum('bsh, oh->bso', core_attn_out, self.out_proj.data)
+        hidden_states = torch.einsum("bsh, oh->bso", core_attn_out, self.out_proj.data)
         return hidden_states
 
 
@@ -332,16 +334,25 @@ class Layer(nn.Module):
             self.linear_attn.load_weight(f)
         self.mlp.load_weight(f)
 
-    def forward(self, hidden_state: torch.Tensor, position: torch.Tensor, residual: torch.Tensor | None, cos: torch.Tensor, sin: torch.Tensor, is_prefill:bool):
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        position: torch.Tensor,
+        residual: torch.Tensor | None,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: dict[str, torch.Tensor],
+        is_prefill: bool,
+    ):
         hidden_state, residual = add_rms_norm(
-            hidden_state, residual, self.input_layernorm.data, self.config.rms_norm_eps
+            hidden_state, residual, self.input_layernorm.data + 1.0, self.config.rms_norm_eps
         )
         if self.layer_type == "full_attention":
-            hidden_state = self.self_attn(hidden_state, position, cos, sin, is_prefill)
+            hidden_state = self.self_attn(hidden_state, position, cos, sin, cache, is_prefill)
         elif self.layer_type == "linear_attention":
-            hidden_state = self.linear_attn(hidden_state, is_prefill)
+            hidden_state = self.linear_attn(hidden_state, cache, is_prefill)
         hidden_state, residual = add_rms_norm(
-            hidden_state, residual, self.post_attention_layernorm.data, self.config.rms_norm_eps
+            hidden_state, residual, self.post_attention_layernorm.data + 1.0, self.config.rms_norm_eps
         )
         hidden_state = self.mlp(hidden_state)
         return hidden_state, residual
@@ -370,7 +381,14 @@ class Qwen3_5(nn.Module):
         logger.info("Model Loaded")
 
     @torch.no_grad()
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor, is_prefill=False):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        hybrid_cache: list[dict[str, torch.Tensor]],
+        is_prefill=False,
+    ):
         rms_norm_eps = self.config.rms_norm_eps
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -384,10 +402,11 @@ class Qwen3_5(nn.Module):
         sin = sin.unsqueeze(-2)
 
         for layer_idx in range(self.config.num_hidden_layers):
-            hidden_states, residual = self.layers[layer_idx](hidden_states, positions, residual, cos, sin, is_prefill)
+            hidden_states, residual = self.layers[layer_idx](
+                hidden_states, positions, residual, cos, sin, hybrid_cache[layer_idx], is_prefill
+            )
 
-        hidden_states, _ = add_rms_norm(hidden_states, residual, self.model_norm.data, rms_norm_eps)
+        hidden_states, _ = add_rms_norm(hidden_states, residual, self.model_norm.data + 1.0, rms_norm_eps)
         hidden_states = (hidden_states[:, -1, :]).squeeze(1)
         logits = torch.einsum("bh,vh->bv", hidden_states, self.embed_tokens.weight)
-
         return logits.argmax(dim=-1)

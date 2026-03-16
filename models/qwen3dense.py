@@ -1,9 +1,9 @@
 import logging
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pydantic import BaseModel
 from safetensors import safe_open
 from tqdm import tqdm
 
@@ -17,8 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger("Qwen3")
 
 
-@dataclass
-class Qwen3Config:
+class Qwen3Config(BaseModel):
     head_dim: int
     hidden_size: int
     hidden_act: str

@@ -1,6 +1,5 @@
 import json
 import os
-from dataclasses import fields
 
 import torch
 
@@ -15,9 +14,7 @@ model_path = os.path.join(base_path, "model.safetensors")
 tokenizer = ChatTokenizer(base_path)
 
 with open(config_path, "r", encoding="utf-8") as f:
-    qwen3_config = Qwen3Config(
-        **{k: v for k, v in json.load(f).items() if k in [field.name for field in fields(Qwen3Config)]}
-    )
+    qwen3_config = Qwen3Config(**json.load(f))
 torch.set_default_device("cpu")
 torch.set_default_dtype(torch.bfloat16)
 model = Qwen3(qwen3_config)
