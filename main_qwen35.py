@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from models.qwen35dense import Qwen3_5, Qwen3_5Config
+from models.qwen35dense import Qwen3_5Config, Qwen3_5TextModel
 from tokenizer_wrapper import ChatTokenizer
 
 torch.manual_seed(123)
@@ -15,19 +15,22 @@ model_path = os.path.join(base_path, "model.safetensors-00001-of-00001.safetenso
 tokenizer = ChatTokenizer(base_path)
 
 with open(config_path, "r", encoding="utf-8") as f:
-    qwen3_config = Qwen3_5Config(**json.load(f)["text_config"])
+    qwen3_config = Qwen3_5Config(**json.load(f))
 
 # qwen3_config.num_hidden_layers = 1
 torch.set_default_device("cpu")
 torch.set_default_dtype(torch.bfloat16)
-model = Qwen3_5(qwen3_config)
+model = Qwen3_5TextModel(qwen3_config.text_config)
 model.load_weight(model_path)
 model = model.eval()
 
 # Create RoPE cos_sin cache
-rotary_dim = int(qwen3_config.head_dim * qwen3_config.rope_parameters.partial_rotary_factor)
-inv_freq = 1.0 / (qwen3_config.rope_parameters.rope_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-t = torch.arange(qwen3_config.max_position_embeddings, dtype=torch.float)
+rotary_dim = int(qwen3_config.text_config.head_dim * qwen3_config.text_config.rope_parameters.partial_rotary_factor)
+inv_freq = 1.0 / (
+    qwen3_config.text_config.rope_parameters.rope_theta
+    ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
+)
+t = torch.arange(qwen3_config.text_config.max_position_embeddings, dtype=torch.float)
 freqs = torch.einsum("i,j -> ij", t, inv_freq)
 cos = freqs.cos()
 sin = freqs.sin()
@@ -36,23 +39,38 @@ cos_sin_cache = torch.cat((cos, sin), dim=-1)
 
 # Create Hybrid Cache for FullAttention and LinearAttention
 hybrid_cache = []
-conv_dim = 2 * qwen3_config.linear_num_key_heads * qwen3_config.linear_key_head_dim + qwen3_config.linear_num_value_heads * qwen3_config.linear_value_head_dim
-for attention_type in qwen3_config.layer_types:
+conv_dim = (
+    2 * qwen3_config.text_config.linear_num_key_heads * qwen3_config.text_config.linear_key_head_dim
+    + qwen3_config.text_config.linear_num_value_heads * qwen3_config.text_config.linear_value_head_dim
+)
+for attention_type in qwen3_config.text_config.layer_types:
     if attention_type == "full_attention":
         hybrid_cache.append(
             {
-                "key": torch.zeros(qwen3_config.num_key_value_heads, qwen3_config.max_position_embeddings, qwen3_config.head_dim),
-                "value": torch.zeros(qwen3_config.num_key_value_heads, qwen3_config.max_position_embeddings, qwen3_config.head_dim),
+                "key": torch.zeros(
+                    qwen3_config.text_config.num_key_value_heads,
+                    qwen3_config.text_config.max_position_embeddings,
+                    qwen3_config.text_config.head_dim,
+                ),
+                "value": torch.zeros(
+                    qwen3_config.text_config.num_key_value_heads,
+                    qwen3_config.text_config.max_position_embeddings,
+                    qwen3_config.text_config.head_dim,
+                ),
             }
         )
     else:
         hybrid_cache.append(
             {
-                "recurrent_state": torch.zeros(1, qwen3_config.linear_num_value_heads, qwen3_config.linear_key_head_dim, qwen3_config.linear_value_head_dim),
-                "conv_state": torch.zeros(1, conv_dim, qwen3_config.linear_conv_kernel_dim),
+                "recurrent_state": torch.zeros(
+                    1,
+                    qwen3_config.text_config.linear_num_value_heads,
+                    qwen3_config.text_config.linear_key_head_dim,
+                    qwen3_config.text_config.linear_value_head_dim,
+                ),
+                "conv_state": torch.zeros(1, conv_dim, qwen3_config.text_config.linear_conv_kernel_dim),
             }
         )
-
 
 
 prompts = ["list all prime numbers within 100"]

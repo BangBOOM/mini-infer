@@ -1,3 +1,4 @@
+from sympy.physics.units import L
 import logging
 
 import torch
@@ -22,7 +23,24 @@ class RopeConfig(BaseModel):
     partial_rotary_factor: float
 
 
-class Qwen3_5Config(BaseModel):
+class VisionConfig(BaseModel):
+    deepstack_visual_indexes: list[int]
+    depth: int
+    hidden_act: str
+    hidden_size: int
+    in_channels: int
+    initializer_range: float
+    intermediate_size: int
+    model_type: str
+    num_heads: int
+    num_position_embeddings: int
+    out_hidden_size: int
+    patch_size: int
+    spatial_merge_size: int
+    temporal_patch_size: int
+
+
+class TextConfig(BaseModel):
     head_dim: int
     hidden_size: int
     hidden_act: str
@@ -46,8 +64,19 @@ class Qwen3_5Config(BaseModel):
     layer_types: list[str]
 
 
+class Qwen3_5Config(BaseModel):
+    image_token_id: int
+    model_type: str
+    text_config: TextConfig
+    tie_word_embeddings: bool
+    video_token_id: int
+    vision_config: VisionConfig
+    vision_end_token_id: int
+    vision_start_token_id: int
+
+
 class FullAtention(nn.Module):
-    def __init__(self, layer_idx: int, config: Qwen3_5Config):
+    def __init__(self, layer_idx: int, config: TextConfig):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -124,7 +153,7 @@ class FullAtention(nn.Module):
 
 
 class LinearAttention(nn.Module):
-    def __init__(self, layer_idx: int, config: Qwen3_5Config):
+    def __init__(self, layer_idx: int, config: TextConfig):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -281,7 +310,7 @@ class LinearAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, layer_idx: int, config: Qwen3_5Config):
+    def __init__(self, layer_idx: int, config: TextConfig):
         super().__init__()
         self.layer_idx = layer_idx
         self.mlp_gate_proj = nn.Parameter(torch.empty(config.intermediate_size, config.hidden_size))
@@ -306,7 +335,7 @@ class MLP(nn.Module):
 
 
 class Layer(nn.Module):
-    def __init__(self, layer_idx: int, config: Qwen3_5Config):
+    def __init__(self, layer_idx: int, config: TextConfig):
         super().__init__()
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
@@ -358,10 +387,9 @@ class Layer(nn.Module):
         return hidden_state, residual
 
 
-class Qwen3_5(nn.Module):
-    def __init__(self, config: Qwen3_5Config, device="cpu"):
+class Qwen3_5TextModel(nn.Module):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        torch.set_default_device(device)
         self.config = config
         self.embed_tokens = nn.Embedding(
             num_embeddings=config.vocab_size, embedding_dim=config.hidden_size, _freeze=True
@@ -410,3 +438,54 @@ class Qwen3_5(nn.Module):
         hidden_states = (hidden_states[:, -1, :]).squeeze(1)
         logits = torch.einsum("bh,vh->bv", hidden_states, self.embed_tokens.weight)
         return logits.argmax(dim=-1)
+
+
+class VisionAttention(nn.Module):
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+        self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=True)
+        self.proj = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=True)
+
+
+class VisionMLP(nn.Module):
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+        self.linear_fc1 = nn.Linear(in_features=config.hidden_size, out_features=config.intermediate_size, bias=True)
+        self.linear_fc2 = nn.Linear(in_features=config.intermediate_size, out_features=config.hidden_size, bias=True)
+
+
+class VisionBlock(nn.Module):
+    def __init__(self, block_idx:int, config: VisionConfig):
+        super().__init__()
+        self.block_idx = block_idx
+        self.norm1_weight = nn.Parameter(torch.empty(config.hidden_size))
+        self.norm1_bias = nn.Parameter(torch.empty(config.hidden_size))
+        self.norm1_weight = nn.Parameter(torch.empty(config.hidden_size))
+        self.norm1_bias = nn.Parameter(torch.empty(config.hidden_size))
+        self.attn = VisionAttention(config)
+
+class VisionPatchMerger(nn.Module):
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.linear_fc2 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.act_fn = nn.GELU()
+        self.norm_weight = nn.Parameter(torch.empty(config.hidden_size))
+        self.norm_bias = nn.Parameter(torch.empty(config.hidden_size))
+
+
+class Qwen3_5VisionModel(nn.Module):
+    def __init__(self, config: VisionConfig):
+        super().__init__()
+        self.config = config
+
+        kernel_size = (config.temporal_patch_size, config.patch_size, config.patch_size)
+        self.patch_embed = nn.Conv3d(
+            in_channels=config.in_channels,
+            out_channels=config.hidden_size,
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=True
+        )
+        self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
