@@ -11,4 +11,5 @@ dependencies = [
     "safetensors>=0.4.0",
     "numpy>=1.26.0",
     "pydantic>=2.12.5",
+    "pillow>=12.1.1",
 ]

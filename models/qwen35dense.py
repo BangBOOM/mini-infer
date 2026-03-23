@@ -1,4 +1,3 @@
-from sympy.physics.units import L
 import logging
 
 import torch
