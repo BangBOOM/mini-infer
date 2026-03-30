@@ -396,10 +396,10 @@ class Qwen3_5TextModel(nn.Module):
         self.layers = nn.ModuleList([Layer(layer_idx, config) for layer_idx in range(config.num_hidden_layers)])
         self.model_norm = nn.Parameter(torch.empty(config.hidden_size))
 
-        # mRoPE inverse frequencies
-        head_dim = config.head_dim
+        # mRoPE inverse frequencies — use rotary_dim (partial), not full head_dim
+        rotary_dim = int(config.head_dim * config.rope_parameters.partial_rotary_factor)
         rope_theta = config.rope_parameters.rope_theta
-        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.mrope_section = config.rope_parameters.mrope_section
 
