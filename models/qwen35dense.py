@@ -421,9 +421,16 @@ class Qwen3_5TextModel(nn.Module):
         position_ids: torch.Tensor,
         hybrid_cache: list[dict[str, torch.Tensor]],
         is_prefill=False,
+        vision_embed: torch.Tensor = None,
+        vision_mask: torch.Tensor = None,
     ):
         rms_norm_eps = self.config.rms_norm_eps
         hidden_states = self.embed_tokens(input_ids)
+
+        # Replace image pad tokens with vision embeddings
+        if vision_embed is not None and vision_mask is not None:
+            hidden_states[vision_mask] = vision_embed
+
         residual = None
 
         batch_size, seqlen, _ = hidden_states.shape
