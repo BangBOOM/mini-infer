@@ -7,7 +7,7 @@ from models.qwen35dense import Qwen3_5Config, Qwen3_5TextModel
 from tokenizer_wrapper import ChatTokenizer
 
 torch.manual_seed(123)
-base_path = "/Users/bangboom/Documents/models/Qwen3.5-0.8B"
+base_path = "/home/bangboom/models/Qwen3.5-0.8B"
 config_path = os.path.join(base_path, "config.json")
 model_path = os.path.join(base_path, "model.safetensors-00001-of-00001.safetensors")
 
@@ -18,23 +18,12 @@ with open(config_path, "r", encoding="utf-8") as f:
     qwen3_config = Qwen3_5Config(**json.load(f))
 
 # qwen3_config.num_hidden_layers = 1
-torch.set_default_device("cpu")
+torch.set_default_device("cuda")
 torch.set_default_dtype(torch.bfloat16)
 model = Qwen3_5TextModel(qwen3_config.text_config)
 model.load_weight(model_path)
+model = model.to("cuda")
 model = model.eval()
-
-# Create RoPE cos_sin cache
-rotary_dim = int(qwen3_config.text_config.head_dim * qwen3_config.text_config.rope_parameters.partial_rotary_factor)
-inv_freq = 1.0 / (
-    qwen3_config.text_config.rope_parameters.rope_theta
-    ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
-)
-t = torch.arange(qwen3_config.text_config.max_position_embeddings, dtype=torch.float)
-freqs = torch.einsum("i,j -> ij", t, inv_freq)
-cos = freqs.cos()
-sin = freqs.sin()
-cos_sin_cache = torch.cat((cos, sin), dim=-1)
 
 
 # Create Hybrid Cache for FullAttention and LinearAttention
@@ -47,28 +36,15 @@ for attention_type in qwen3_config.text_config.layer_types:
     if attention_type == "full_attention":
         hybrid_cache.append(
             {
-                "key": torch.zeros(
-                    qwen3_config.text_config.num_key_value_heads,
-                    qwen3_config.text_config.max_position_embeddings,
-                    qwen3_config.text_config.head_dim,
-                ),
-                "value": torch.zeros(
-                    qwen3_config.text_config.num_key_value_heads,
-                    qwen3_config.text_config.max_position_embeddings,
-                    qwen3_config.text_config.head_dim,
-                ),
+                "key": torch.zeros(qwen3_config.text_config.num_key_value_heads, qwen3_config.text_config.max_position_embeddings, qwen3_config.text_config.head_dim).cuda(),
+                "value": torch.zeros(qwen3_config.text_config.num_key_value_heads, qwen3_config.text_config.max_position_embeddings, qwen3_config.text_config.head_dim).cuda(),
             }
         )
     else:
         hybrid_cache.append(
             {
-                "recurrent_state": torch.zeros(
-                    1,
-                    qwen3_config.text_config.linear_num_value_heads,
-                    qwen3_config.text_config.linear_key_head_dim,
-                    qwen3_config.text_config.linear_value_head_dim,
-                ),
-                "conv_state": torch.zeros(1, conv_dim, qwen3_config.text_config.linear_conv_kernel_dim),
+                "recurrent_state": torch.zeros(1, qwen3_config.text_config.linear_num_value_heads, qwen3_config.text_config.linear_key_head_dim, qwen3_config.text_config.linear_value_head_dim).cuda(),
+                "conv_state": torch.zeros(1, conv_dim, qwen3_config.text_config.linear_conv_kernel_dim).cuda(),
             }
         )
 
@@ -85,20 +61,23 @@ print(prompts)
 # prefill
 input_ids = tokenizer(prompts, return_tensors="pt")["input_ids"]
 print(input_ids)
-positions = torch.tensor(list(range(input_ids.shape[-1])), dtype=torch.int)
-predict_tokens = model(input_ids, positions, cos_sin_cache, hybrid_cache, is_prefill=True)
+seq_len = input_ids.shape[-1]
+# 3D position_ids (3, 1, T) — for text-only, all channels are identical
+position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).unsqueeze(0).expand(3, 1, -1).cuda()
+predict_tokens = model(input_ids.cuda(), position_ids, hybrid_cache, is_prefill=True)
 generated_token = tokenizer.decode(predict_tokens)
 res = ""
 res += generated_token
-position_id = positions[-1]
+position_id = seq_len - 1
 print("Done Prefill:", position_id)
 print(generated_token, end="", flush=True)
-while position_id < 25:
+while position_id < 100:
     position_id += 1
     output = [generated_token]
     input_ids = tokenizer(output, return_tensors="pt")["input_ids"]
-    positions = torch.tensor([position_id], dtype=torch.int)
-    predict_tokens = model(input_ids, positions, cos_sin_cache, hybrid_cache, is_prefill=False)
+    # Single token decode: (3, 1, 1) — all channels same for text-only
+    position_ids = torch.full((3, 1, 1), position_id, dtype=torch.long).cuda()
+    predict_tokens = model(input_ids.cuda(), position_ids, hybrid_cache, is_prefill=False)
     generated_token = tokenizer.decode(predict_tokens)
     res += generated_token
     if predict_tokens == tokenizer.eos_token_id:

@@ -111,6 +111,34 @@ def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> to
     return output.to(orig_dtype)
 
 
+def compute_mrope_cos_sin(position_ids: torch.Tensor, inv_freq: torch.Tensor, mrope_section: list[int]):
+    """Compute mRoPE cos/sin for multimodal inputs.
+
+    Args:
+        position_ids: (3, B, T) - T/H/W position channels
+        inv_freq: (head_dim//2,) - inverse frequencies computed from rope_theta
+        mrope_section: [int, int, int] - number of freq components for T/H/W
+
+    Returns:
+        cos, sin of shape (B, T, head_dim//2)
+    """
+    # freqs: (3, B, T, head_dim//2)
+    inv_freq_exp = inv_freq[None, None, :, None].expand(3, position_ids.shape[1], -1, 1)
+    pos_exp = position_ids[:, :, None, :].float()
+    freqs = (inv_freq_exp @ pos_exp).transpose(2, 3)
+
+    # Interleave T/H/W: start with T, place H at offset 1, W at offset 2 (stride 3)
+    freqs_out = freqs[0]
+    for dim, offset in enumerate((1, 2), start=1):
+        length = mrope_section[dim] * 3
+        idx = slice(offset, length, 3)
+        freqs_out[..., idx] = freqs[dim][..., idx]
+
+    cos = freqs_out.cos()
+    sin = freqs_out.sin()
+    return cos, sin
+
+
 def l2norm(x, dim=-1, eps=1e-6):
     """L2 normalization.
 

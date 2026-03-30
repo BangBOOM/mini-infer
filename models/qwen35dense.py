@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from safetensors import safe_open
 from tqdm import tqdm
 
-from models.utils import add_rms_norm, apply_rope, apply_rotary_pos_emb_vision, l2norm, rms_norm
+from models.utils import add_rms_norm, apply_rope, apply_rotary_pos_emb_vision, compute_mrope_cos_sin, l2norm, rms_norm
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
@@ -396,6 +396,13 @@ class Qwen3_5TextModel(nn.Module):
         self.layers = nn.ModuleList([Layer(layer_idx, config) for layer_idx in range(config.num_hidden_layers)])
         self.model_norm = nn.Parameter(torch.empty(config.hidden_size))
 
+        # mRoPE inverse frequencies
+        head_dim = config.head_dim
+        rope_theta = config.rope_parameters.rope_theta
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.mrope_section = config.rope_parameters.mrope_section
+
     def load_weight(self, path):
         # currently only support single file
         logger.info("Model Loading...")
@@ -411,8 +418,7 @@ class Qwen3_5TextModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
+        position_ids: torch.Tensor,
         hybrid_cache: list[dict[str, torch.Tensor]],
         is_prefill=False,
     ):
@@ -422,11 +428,15 @@ class Qwen3_5TextModel(nn.Module):
 
         batch_size, seqlen, _ = hidden_states.shape
         assert batch_size == 1, "Currently only support singual request"
-        # get cos and sin
-        cos_sin = cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.unsqueeze(-2)
-        sin = sin.unsqueeze(-2)
+
+        # 1D positions for KV cache indexing (from text position channel)
+        positions = position_ids[0, 0]  # (T,)
+
+        # mRoPE cos/sin
+        cos, sin = compute_mrope_cos_sin(position_ids, self.inv_freq, self.mrope_section)
+        # cos, sin: (B, T, head_dim//2) → reshape for apply_rope: (T, 1, head_dim//2)
+        cos = cos[0].unsqueeze(-2)  # (T, 1, head_dim//2)
+        sin = sin[0].unsqueeze(-2)  # (T, 1, head_dim//2)
 
         for layer_idx in range(self.config.num_hidden_layers):
             hidden_states, residual = self.layers[layer_idx](
