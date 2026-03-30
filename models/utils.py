@@ -89,6 +89,28 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return out.view(orig_shape)
 
 
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half: [x1, x2] -> [-x2, x1]. Used in vision model RoPE."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE for vision model.
+
+    Args:
+        tensor: (batch, seq_len, n_heads, head_dim)
+        freqs: (seq_len, head_dim // 2)
+    """
+    orig_dtype = tensor.dtype
+    tensor = tensor.float()
+    cos = freqs.cos().unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+    sin = freqs.sin().unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+    output = (tensor * cos) + (rotate_half(tensor) * sin)
+    return output.to(orig_dtype)
+
+
 def l2norm(x, dim=-1, eps=1e-6):
     """L2 normalization.
 
