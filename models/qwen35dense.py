@@ -421,8 +421,8 @@ class Qwen3_5TextModel(nn.Module):
         position_ids: torch.Tensor,
         hybrid_cache: list[dict[str, torch.Tensor]],
         is_prefill=False,
-        vision_embed: torch.Tensor = None,
-        vision_mask: torch.Tensor = None,
+        vision_embed: torch.Tensor|None = None,
+        vision_mask: torch.Tensor|None = None,
     ):
         rms_norm_eps = self.config.rms_norm_eps
         hidden_states = self.embed_tokens(input_ids)
@@ -719,4 +719,3 @@ class Qwen3_5VisionModel(nn.Module):
             hidden_states = blk(hidden_states, cu_seqlens, rotary_pos_emb)
 
         return self.merger(hidden_states)
-
